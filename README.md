@@ -279,4 +279,108 @@ Ultimately, our strategy ensures **graceful evolution** of the system. By buildi
 - HiveMQ MQTT security fundamentals (importance of TLS for MQTT)  
 - AWS Prescriptive Guidance on GitHub Flow suitability for CI/CD  
 - RIMdev Blog on sharing API contracts via NuGet SDKs in .NET  
-- Microsoft documentation advising using WiX Toolset for Windows Service installers  
+- Microsoft documentation advising using WiX Toolset for Windows Service installers
+```
+using Azure.Identity;
+using Azure.Extensions.AspNetCore.Configuration.Secrets;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Optional: pick vault name from ENV for flexibility
+var keyVaultUri = new Uri(Environment.GetEnvironmentVariable("KEYVAULT_URI") ??
+                          "https://kv-myproduct.vault.azure.net/");
+
+// order matters: later providers override earlier ones
+builder.Configuration                 // JSON / ENV already loaded by default builder
+       .AddAzureKeyVault(
+            keyVaultUri,
+            new DefaultAzureCredential(),          // works for MI or SP
+            new KeyVaultSecretManager());
+
+builder.Services.Configure<DbSettings>(
+        builder.Configuration.GetSection("App"));  // binds App:DbConn
+
+var app = builder.Build();
+
+app.MapGet("/", (IOptions<DbSettings> opt) => 
+    $"DB conn string from KV: {opt.Value.DbConn}");
+
+app.Run();
+
+record DbSettings(string DbConn);
+```
+
+```
+az identity create -g rg-infra -n mi-integration
+MI_CLIENT_ID=$(az identity show -g rg-infra -n mi-integration --query clientId -o tsv)
+
+# allow the MI to read secrets
+az keyvault set-policy -n kv-myproduct --secret-permissions get list --spn $MI_CLIENT_ID
+```
+
+```
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: integration-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: integration }
+  template:
+    metadata:
+      labels: { app: integration }
+      annotations:
+        # Workload Identity annotation
+        azure.workload.identity/client-id: "<MI_CLIENT_ID>"
+    spec:
+      serviceAccountName: integration-sa
+      containers:
+      - name: app
+        image: myacr.azurecr.io/integration-service:1.6.0
+        env:
+        - name: KEYVAULT_URI           # pass vault URL to the code
+          value: "https://kv-myproduct.vault.azure.net/"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: integration-sa
+  annotations:
+    azure.workload.identity/client-id: "<MI_CLIENT_ID>"
+```
+
+onprem
+```
+az ad sp create-for-rbac -n sp-integration --skip-assignment \
+  --role "Key Vault Secrets User" --scopes /subscriptions/<sub>/resourceGroups/rg-infra/providers/Microsoft.KeyVault/vaults/kv-myproduct
+# Output: appId, tenant, password  -> store safely
+```
+
+```
+version: "3.9"
+services:
+  integration:
+    image: myacr.azurecr.io/integration-service:1.6.0
+    environment:
+      KEYVAULT_URI: "https://kv-myproduct.vault.azure.net/"
+      # creds for DefaultAzureCredential
+      AZURE_TENANT_ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+      AZURE_CLIENT_ID: "bbbbbbbb-1111-2222-3333-444444444444"
+      AZURE_CLIENT_SECRET: "paste-long-secret-here"
+    restart: unless-stopped
+```
+
+hotreload
+
+var reloadInterval = TimeSpan.FromMinutes(15);
+
+builder.Configuration.AddAzureKeyVault(
+    keyVaultUri,
+    new DefaultAzureCredential(),
+    new KeyVaultSecretManager(),
+    new Azure.Extensions.AspNetCore.Configuration.Secrets.AzureKeyVaultConfigurationOptions
+    {
+        ReloadInterval = reloadInterval
+    });
